@@ -4,19 +4,17 @@ import { createClient } from 'jsr:@supabase/supabase-js@2';
 /**
  * Supabase Edge Function: update-notification-state
  *
- * Обновление состояния уведомлений пользователя:
- * - timezone (IANA, напр. "America/New_York")
- * - last_app_open (ISO-строка или true для текущего момента)
- * - notifications_enabled (boolean)
+ * Обновление состояния уведомлений пользователя в profiles_notifications.
+ * Вызывается iOS-клиентом при открытии приложения и смене настроек.
  *
  * POST /functions/v1/update-notification-state
  * Authorization: Bearer <user access token>
  * Content-Type: application/json
  *
  * {
- *   "timezone": "Europe/Moscow",
- *   "last_app_open": true,
- *   "notifications_enabled": true
+ *   "timezone": "America/New_York",      // IANA timezone
+ *   "last_app_open": true,               // true = сейчас, или ISO-строка
+ *   "fcm_token": "firebase-token-here"   // опционально, обновить FCM токен
  * }
  */
 
@@ -58,7 +56,7 @@ Deno.serve(async (req) => {
         }
 
         const body = await req.json();
-        const updates = { updated_at: new Date().toISOString() };
+        const updates = {};
 
         if (typeof body.timezone === 'string' && body.timezone.trim().length > 0) {
             updates.timezone = body.timezone.trim();
@@ -70,17 +68,21 @@ Deno.serve(async (req) => {
             updates.last_app_open = body.last_app_open;
         }
 
-        if (typeof body.notifications_enabled === 'boolean') {
-            updates.notifications_enabled = body.notifications_enabled;
+        if (typeof body.fcm_token === 'string') {
+            updates.fcm_token = body.fcm_token.trim() || null;
+        }
+
+        if (Object.keys(updates).length === 0) {
+            return json({ success: false, error: 'No fields to update' }, 400);
         }
 
         const { data, error } = await supabase
-            .from('notification_state')
+            .from('profiles_notifications')
             .upsert(
-                { user_id: user.id, ...updates },
-                { onConflict: 'user_id' },
+                { id: user.id, ...updates },
+                { onConflict: 'id' },
             )
-            .select('user_id, timezone, last_app_open, notifications_enabled, updated_at')
+            .select('id, fcm_token, timezone, last_app_open')
             .single();
 
         if (error) {

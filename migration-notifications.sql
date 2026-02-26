@@ -1,112 +1,65 @@
 -- ============================================================
 -- ThryveLog MVP Notification System — Database Migration
+-- Расширяет существующие таблицы: profiles_notifications, notifications
 -- ============================================================
 
--- 1. Push-токены устройств пользователей (APNs / FCM / Expo)
-CREATE TABLE IF NOT EXISTS push_tokens (
-    id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-    user_id     uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    token       text NOT NULL,
-    platform    text NOT NULL DEFAULT 'ios'
-                    CHECK (platform IN ('ios', 'android')),
-    created_at  timestamptz DEFAULT now(),
-    updated_at  timestamptz DEFAULT now(),
-    UNIQUE (user_id, token)
-);
+-- 1. profiles_notifications: добавляем timezone и last_app_open
+ALTER TABLE profiles_notifications
+    ADD COLUMN IF NOT EXISTS timezone text DEFAULT 'America/New_York',
+    ADD COLUMN IF NOT EXISTS last_app_open timestamptz;
 
-CREATE INDEX IF NOT EXISTS idx_push_tokens_user_id ON push_tokens(user_id);
+-- 2. notifications: добавляем type, reference_id, title для дедупликации и логики
+ALTER TABLE notifications
+    ADD COLUMN IF NOT EXISTS type text,
+    ADD COLUMN IF NOT EXISTS reference_id uuid,
+    ADD COLUMN IF NOT EXISTS title text;
 
-ALTER TABLE push_tokens ENABLE ROW LEVEL SECURITY;
+-- Ограничение на допустимые типы
+ALTER TABLE notifications
+    ADD CONSTRAINT notifications_type_check
+    CHECK (type IN ('task_reminder', 'overdue_task', 'journal_nudge'));
 
-CREATE POLICY push_tokens_select ON push_tokens
-    FOR SELECT USING (auth.uid() = user_id);
-CREATE POLICY push_tokens_insert ON push_tokens
-    FOR INSERT WITH CHECK (auth.uid() = user_id);
-CREATE POLICY push_tokens_delete ON push_tokens
-    FOR DELETE USING (auth.uid() = user_id);
+-- Индексы для быстрой дедупликации
+CREATE INDEX IF NOT EXISTS idx_notifications_user_type
+    ON notifications(user_id, type);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_type_ref
+    ON notifications(user_id, type, reference_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_created_at
+    ON notifications(created_at);
 
--- 2. Лог отправленных уведомлений (дедупликация + аналитика)
-CREATE TABLE IF NOT EXISTS notification_log (
-    id            uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-    user_id       uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    type          text NOT NULL
-                      CHECK (type IN ('task_reminder', 'overdue_task', 'journal_nudge')),
-    reference_id  uuid,          -- task_id для task-уведомлений, NULL для journal nudge
-    title         text NOT NULL,
-    body          text NOT NULL,
-    sent_at       timestamptz DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_notification_log_user_type
-    ON notification_log(user_id, type);
-CREATE INDEX IF NOT EXISTS idx_notification_log_reference
-    ON notification_log(user_id, type, reference_id);
-CREATE INDEX IF NOT EXISTS idx_notification_log_sent_at
-    ON notification_log(sent_at);
-
-ALTER TABLE notification_log ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY notification_log_select ON notification_log
-    FOR SELECT USING (auth.uid() = user_id);
-
--- 3. Состояние уведомлений пользователя (таймзона, последнее открытие приложения)
-CREATE TABLE IF NOT EXISTS notification_state (
-    id                     uuid DEFAULT gen_random_uuid() PRIMARY KEY,
-    user_id                uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE UNIQUE,
-    timezone               text DEFAULT 'America/New_York',
-    last_app_open          timestamptz,
-    notifications_enabled  boolean DEFAULT true,
-    created_at             timestamptz DEFAULT now(),
-    updated_at             timestamptz DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_notification_state_user_id
-    ON notification_state(user_id);
-
-ALTER TABLE notification_state ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY notification_state_select ON notification_state
-    FOR SELECT USING (auth.uid() = user_id);
-CREATE POLICY notification_state_insert ON notification_state
-    FOR INSERT WITH CHECK (auth.uid() = user_id);
-CREATE POLICY notification_state_update ON notification_state
-    FOR UPDATE USING (auth.uid() = user_id);
+-- Индекс на fcm_token для фильтрации пользователей с токенами
+CREATE INDEX IF NOT EXISTS idx_profiles_notifications_fcm_token
+    ON profiles_notifications(id)
+    WHERE fcm_token IS NOT NULL;
 
 -- ============================================================
 -- pg_cron расписание (выполнять из Supabase Dashboard → SQL Editor)
+-- Замените SERVICE_ROLE_KEY на реальный ключ
 -- ============================================================
+
 -- Напоминания о задачах — каждую минуту
--- SELECT cron.schedule('process-task-reminders', '* * * * *',
+-- SELECT cron.schedule('process-notifications-reminders', '* * * * *',
 --   $$SELECT net.http_post(
---     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-task-reminders',
---     headers := jsonb_build_object(
---       'Authorization', 'Bearer ' || current_setting('app.settings.service_role_key'),
---       'Content-Type', 'application/json'
---     ),
---     body := '{}'::jsonb
+--     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-notifications',
+--     headers := '{"Authorization": "Bearer SERVICE_ROLE_KEY", "Content-Type": "application/json"}'::jsonb,
+--     body := '{"type": "task_reminders"}'::jsonb
 --   )$$
 -- );
---
+
 -- Просроченные задачи — каждые 15 минут
--- SELECT cron.schedule('process-overdue-tasks', '*/15 * * * *',
+-- SELECT cron.schedule('process-notifications-overdue', '*/15 * * * *',
 --   $$SELECT net.http_post(
---     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-overdue-tasks',
---     headers := jsonb_build_object(
---       'Authorization', 'Bearer ' || current_setting('app.settings.service_role_key'),
---       'Content-Type', 'application/json'
---     ),
---     body := '{}'::jsonb
+--     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-notifications',
+--     headers := '{"Authorization": "Bearer SERVICE_ROLE_KEY", "Content-Type": "application/json"}'::jsonb,
+--     body := '{"type": "overdue_tasks"}'::jsonb
 --   )$$
 -- );
---
+
 -- Journal nudge — каждый час
--- SELECT cron.schedule('process-journal-nudge', '0 * * * *',
+-- SELECT cron.schedule('process-notifications-journal', '0 * * * *',
 --   $$SELECT net.http_post(
---     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-journal-nudge',
---     headers := jsonb_build_object(
---       'Authorization', 'Bearer ' || current_setting('app.settings.service_role_key'),
---       'Content-Type', 'application/json'
---     ),
---     body := '{}'::jsonb
+--     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-notifications',
+--     headers := '{"Authorization": "Bearer SERVICE_ROLE_KEY", "Content-Type": "application/json"}'::jsonb,
+--     body := '{"type": "journal_nudge"}'::jsonb
 --   )$$
 -- );
