@@ -33,15 +33,21 @@ CREATE INDEX IF NOT EXISTS idx_profiles_notifications_fcm_token
     WHERE fcm_token IS NOT NULL;
 
 -- ============================================================
--- pg_cron расписание (выполнять из Supabase Dashboard → SQL Editor)
--- Замените SERVICE_ROLE_KEY на реальный ключ
+-- pg_cron расписание
+-- Раскомментировать и выполнить из Supabase Dashboard → SQL Editor
+--
+-- service_role key берётся автоматически из supabase_functions.get_secret()
+-- (встроенная функция Supabase — ничего настраивать не нужно)
 -- ============================================================
 
 -- Напоминания о задачах — каждую минуту
 -- SELECT cron.schedule('process-notifications-reminders', '* * * * *',
 --   $$SELECT net.http_post(
 --     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-notifications',
---     headers := '{"Authorization": "Bearer SERVICE_ROLE_KEY", "Content-Type": "application/json"}'::jsonb,
+--     headers := jsonb_build_object(
+--       'Authorization', 'Bearer ' || (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'service_role_key' LIMIT 1),
+--       'Content-Type', 'application/json'
+--     ),
 --     body := '{"type": "task_reminders"}'::jsonb
 --   )$$
 -- );
@@ -50,7 +56,10 @@ CREATE INDEX IF NOT EXISTS idx_profiles_notifications_fcm_token
 -- SELECT cron.schedule('process-notifications-overdue', '*/15 * * * *',
 --   $$SELECT net.http_post(
 --     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-notifications',
---     headers := '{"Authorization": "Bearer SERVICE_ROLE_KEY", "Content-Type": "application/json"}'::jsonb,
+--     headers := jsonb_build_object(
+--       'Authorization', 'Bearer ' || (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'service_role_key' LIMIT 1),
+--       'Content-Type', 'application/json'
+--     ),
 --     body := '{"type": "overdue_tasks"}'::jsonb
 --   )$$
 -- );
@@ -59,7 +68,20 @@ CREATE INDEX IF NOT EXISTS idx_profiles_notifications_fcm_token
 -- SELECT cron.schedule('process-notifications-journal', '0 * * * *',
 --   $$SELECT net.http_post(
 --     url := 'https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-notifications',
---     headers := '{"Authorization": "Bearer SERVICE_ROLE_KEY", "Content-Type": "application/json"}'::jsonb,
+--     headers := jsonb_build_object(
+--       'Authorization', 'Bearer ' || (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'service_role_key' LIMIT 1),
+--       'Content-Type', 'application/json'
+--     ),
 --     body := '{"type": "journal_nudge"}'::jsonb
 --   )$$
+-- );
+
+-- ============================================================
+-- Подготовка: сохранить service_role_key в Vault (выполнить ОДИН раз)
+-- Dashboard → Settings → API → service_role (secret) → скопировать
+-- ============================================================
+-- SELECT vault.create_secret(
+--   'ВАШ_SERVICE_ROLE_KEY_СЮДА',
+--   'service_role_key',
+--   'Service role key for cron → Edge Functions'
 -- );
