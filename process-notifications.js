@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from 'jsr:@supabase/supabase-js@2';
+import { JWT } from 'npm:google-auth-library@9';
 
 /**
  * Supabase Edge Function: process-notifications
@@ -59,61 +60,23 @@ function getServiceAccount() {
 
 // ─── FCM HTTP v1 ────────────────────────────────────────────
 
-function base64url(data) {
-    const base64 = btoa(data);
-    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function base64urlEncode(buf) {
-    const bytes = new Uint8Array(buf);
-    let binary = '';
-    for (const b of bytes) binary += String.fromCharCode(b);
-    return base64url(binary);
-}
-
 async function getAccessToken(serviceAccount) {
-    const pk = serviceAccount.private_key || '';
-    const pemBody = pk
-        .replace(/\\n/g, '\n')
-        .replace(/-----BEGIN PRIVATE KEY-----/g, '')
-        .replace(/-----END PRIVATE KEY-----/g, '')
-        .replace(/\s/g, '');
-    if (!pemBody || pemBody.length < 100) {
+    const privateKey = (serviceAccount.private_key || '').replace(/\\n/g, '\n');
+    if (!privateKey || !privateKey.includes('BEGIN PRIVATE KEY')) {
         throw new Error('Invalid private_key: too short or missing. Check FIREBASE_PRIVATE_KEY.');
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-    const payload = base64url(JSON.stringify({
-        iss: serviceAccount.client_email,
-        sub: serviceAccount.client_email,
-        aud: 'https://oauth2.googleapis.com/token',
-        iat: now,
-        exp: now + 3600,
-        scope: 'https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/cloud-platform',
-    }));
-
-    const signingInput = `${header}.${payload}`;
-    const binaryDer = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
-
-    const cryptoKey = await crypto.subtle.importKey(
-        'pkcs8', binaryDer, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign'],
-    );
-    const signature = await crypto.subtle.sign(
-        'RSASSA-PKCS1-v1_5', cryptoKey, new TextEncoder().encode(signingInput),
-    );
-
-    const jwt = `${signingInput}.${base64urlEncode(signature)}`;
-
-    const resp = await fetch('https://oauth2.googleapis.com/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+    const jwtClient = new JWT({
+        email: serviceAccount.client_email,
+        key: privateKey,
+        scopes: ['https://www.googleapis.com/auth/firebase.messaging'],
     });
 
-    const data = await resp.json();
-    if (!data.access_token) throw new Error(`FCM auth failed: ${JSON.stringify(data)}`);
-    return data.access_token;
+    const tokens = await jwtClient.authorize();
+    if (!tokens?.access_token) {
+        throw new Error('FCM auth failed: no access token');
+    }
+    return tokens.access_token;
 }
 
 async function sendFcm(accessToken, projectId, fcmToken, title, body) {
