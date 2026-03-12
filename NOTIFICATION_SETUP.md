@@ -22,12 +22,19 @@
 
 В Supabase Dashboard: **Edge Functions** → **process-notifications** → **Secrets**
 
-Добавьте переменные:
+**Вариант A** — один JSON (рекомендуется):
 
 | Имя | Значение |
 |-----|----------|
-| `FCM_PROJECT_ID` | ID проекта Firebase (например `my-app-12345`) |
-| `FCM_SERVICE_ACCOUNT` | Полное содержимое JSON-файла Service Account (одна строка) |
+| `FCM_SERVICE_ACCOUNT` | **Полное содержимое** JSON-файла Service Account. Откройте файл, скопируйте всё (начинается с `{"type":"service_account",...}`). |
+
+**Вариант B** — отдельные переменные (если JSON вызывает проблемы):
+
+| Имя | Значение |
+|-----|----------|
+| `FIREBASE_PROJECT_ID` | ID проекта (например `thryvelog-inc`) |
+| `FIREBASE_CLIENT_EMAIL` | `client_email` из JSON (например `firebase-adminsdk-xxx@project.iam.gserviceaccount.com`) |
+| `FIREBASE_PRIVATE_KEY` | `private_key` из JSON. **Важно:** если 401 сохраняется, попробуйте вставить ключ в одну строку, заменив переносы на `\n` (два символа: обратный слэш + n). Пример: `-----BEGIN PRIVATE KEY-----\nMIIEvg...\n-----END PRIVATE KEY-----\n` |
 
 ### 3. Service Role Key для Cron
 
@@ -80,6 +87,21 @@ await supabase.functions.invoke("update-notification-state", options: .init(
 | **Overdue Task** | +1 час после дедлайна | Каждые 15 минут |
 | **Journal Nudge** | 72ч без записей в дневнике | 18:00–20:30 по локальному времени, каждый час |
 
+## Важно: APNS для iOS
+
+Ошибка **401 THIRD_PARTY_AUTH_ERROR** часто связана с **APNS (Apple Push)**, а не с OAuth.
+
+Для iOS push нужно настроить APNS в Firebase:
+
+1. **Firebase Console** → **Project settings** → **Cloud Messaging**
+2. В разделе **Apple app configuration** загрузите **APNs Authentication Key** (.p8)
+3. Укажите **Key ID**, **Team ID** (без пробелов, uppercase)
+4. Bundle ID должен совпадать с приложением
+
+Без APNS ключа push на iOS не будут работать.
+
+---
+
 ## Проверка
 
 Ручной вызов для теста:
@@ -92,6 +114,14 @@ curl -X POST "https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-noti
 ```
 
 Логи: **Edge Functions** → **process-notifications** → **Logs**
+
+В логах при каждом запуске:
+- `[reminders] now=... window=[...]` — текущее время и окно поиска
+- `[reminders] fetched N tasks` — сколько задач с напоминаниями
+- `[reminders] task=X skip: outside window` — задача пропущена (вне окна, проверьте timezone)
+- `Task reminder sent: task=X` — уведомление отправлено
+
+**Важно:** `select_date` и `select_time` интерпретируются в **локальном времени пользователя**. Убедитесь, что клиент передаёт `timezone` в `update-notification-state` при открытии приложения.
 
 ## Cron
 
