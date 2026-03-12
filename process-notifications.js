@@ -15,10 +15,9 @@ import { createClient } from 'jsr:@supabase/supabase-js@2';
  * Content-Type: application/json
  * { "type": "task_reminders" }
  *
- * Env vars:
- *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
- *   FCM_PROJECT_ID        — Firebase project ID
- *   FCM_SERVICE_ACCOUNT   — JSON service account key (строка)
+ * Env vars (один из вариантов):
+ *   Вариант A: FCM_SERVICE_ACCOUNT — полный JSON Service Account
+ *   Вариант B: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
  */
 
 const corsHeaders = {
@@ -31,6 +30,32 @@ const json = (body, status = 200) =>
         status,
         headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
+
+// ─── Service Account (два формата) ──────────────────────────
+
+function getServiceAccount() {
+    const jsonStr = Deno.env.get('FCM_SERVICE_ACCOUNT');
+    if (jsonStr?.trim()) {
+        try {
+            const parsed = JSON.parse(jsonStr.trim());
+            if (parsed.project_id && parsed.client_email && parsed.private_key) {
+                return {
+                    project_id: parsed.project_id,
+                    client_email: parsed.client_email,
+                    private_key: parsed.private_key.replace(/\\n/g, '\n'),
+                };
+            }
+        } catch { /* fallback to separate vars */ }
+    }
+
+    const projectId = Deno.env.get('FIREBASE_PROJECT_ID');
+    const clientEmail = Deno.env.get('FIREBASE_CLIENT_EMAIL');
+    const privateKey = Deno.env.get('FIREBASE_PRIVATE_KEY')?.replace(/\\n/g, '\n');
+    if (projectId && clientEmail && privateKey) {
+        return { project_id: projectId, client_email: clientEmail, private_key: privateKey };
+    }
+    return null;
+}
 
 // ─── FCM HTTP v1 ────────────────────────────────────────────
 
@@ -47,6 +72,16 @@ function base64urlEncode(buf) {
 }
 
 async function getAccessToken(serviceAccount) {
+    const pk = serviceAccount.private_key || '';
+    const pemBody = pk
+        .replace(/\\n/g, '\n')
+        .replace(/-----BEGIN PRIVATE KEY-----/g, '')
+        .replace(/-----END PRIVATE KEY-----/g, '')
+        .replace(/\s/g, '');
+    if (!pemBody || pemBody.length < 100) {
+        throw new Error('Invalid private_key: too short or missing. Check FIREBASE_PRIVATE_KEY.');
+    }
+
     const now = Math.floor(Date.now() / 1000);
     const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
     const payload = base64url(JSON.stringify({
@@ -55,14 +90,10 @@ async function getAccessToken(serviceAccount) {
         aud: 'https://oauth2.googleapis.com/token',
         iat: now,
         exp: now + 3600,
-        scope: 'https://www.googleapis.com/auth/firebase.messaging',
+        scope: 'https://www.googleapis.com/auth/firebase.messaging https://www.googleapis.com/auth/cloud-platform',
     }));
 
     const signingInput = `${header}.${payload}`;
-    const pemBody = serviceAccount.private_key
-        .replace(/-----BEGIN PRIVATE KEY-----/, '')
-        .replace(/-----END PRIVATE KEY-----/, '')
-        .replace(/\n/g, '');
     const binaryDer = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
 
     const cryptoKey = await crypto.subtle.importKey(
@@ -86,6 +117,11 @@ async function getAccessToken(serviceAccount) {
 }
 
 async function sendFcm(accessToken, projectId, fcmToken, title, body) {
+    if (!accessToken || typeof accessToken !== 'string') {
+        console.error('sendFcm: accessToken is empty or invalid');
+        return { ok: false, invalidToken: false };
+    }
+
     const message = {
         message: {
             token: fcmToken,
@@ -111,15 +147,32 @@ async function sendFcm(accessToken, projectId, fcmToken, title, body) {
     if (!resp.ok) {
         const err = await resp.text();
         console.error(`FCM send error (token=${fcmToken.slice(0, 10)}...): ${err}`);
-        return false;
+        const invalidToken = resp.status === 401 || resp.status === 404 ||
+            (resp.status === 400 && err.includes('INVALID_ARGUMENT'));
+        if (invalidToken) {
+            console.error(`FCM ${resp.status}: Invalid/expired token — clearing fcm_token for user`);
+        }
+        return { ok: false, invalidToken };
     }
-    return true;
+    return { ok: true };
 }
 
-async function sendToUser(accessToken, projectId, fcmToken, title, body) {
+async function sendToUser(accessToken, projectId, fcmToken, title, body, userId, supabase) {
     if (!fcmToken) return false;
     try {
-        return await sendFcm(accessToken, projectId, fcmToken, title, body);
+        const result = await sendFcm(accessToken, projectId, fcmToken, title, body);
+        if (result.invalidToken && userId && supabase) {
+            const { error } = await supabase
+                .from('profiles_notifications')
+                .update({ fcm_token: null })
+                .eq('id', userId);
+            if (error) {
+                console.error(`Failed to clear invalid token for user ${userId}:`, error.message);
+            } else {
+                console.log(`Cleared invalid fcm_token for user ${userId}`);
+            }
+        }
+        return result.ok;
     } catch (err) {
         console.error('sendToUser error:', err.message);
         return false;
@@ -176,6 +229,23 @@ function getUserLocalHour(utcDate, timezone) {
     }
 }
 
+/** Парсит date+time в timezone пользователя и возвращает UTC Date */
+function parseTaskDateTimeInTimezone(selectDate, selectTime, timezone) {
+    const timeStr = String(selectTime).length === 5 ? `${selectTime}:00` : selectTime;
+    const tempUtc = new Date(`${selectDate}T${timeStr}Z`);
+    const noonUtc = new Date(`${selectDate}T12:00:00Z`);
+    try {
+        const hourParts = new Intl.DateTimeFormat('en-US', {
+            timeZone: timezone, hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
+        }).formatToParts(noonUtc);
+        const h = parseInt(hourParts.find((p) => p.type === 'hour')?.value ?? '12', 10);
+        const offsetHours = h - 12;
+        return new Date(tempUtc.getTime() - offsetHours * 60 * 60 * 1000);
+    } catch {
+        return tempUtc;
+    }
+}
+
 function getUserLocalDateStr(utcDate, timezone) {
     try {
         return new Intl.DateTimeFormat('en-CA', {
@@ -201,8 +271,9 @@ async function logNotification(supabase, userId, type, referenceId, title, body)
 
 async function processTaskReminders(supabase, accessToken, projectId) {
     const now = new Date();
-    const windowStart = new Date(now.getTime() - 90_000);
-    const windowEnd = new Date(now.getTime() + 30_000);
+    const windowStart = new Date(now.getTime() - 180_000);
+    const windowEnd = new Date(now.getTime() + 60_000);
+    console.log(`[reminders] now=${now.toISOString()} window=[${windowStart.toISOString()} .. ${windowEnd.toISOString()}]`);
 
     const { data: tasks, error } = await supabase
         .from('tasks')
@@ -214,15 +285,29 @@ async function processTaskReminders(supabase, accessToken, projectId) {
 
     if (error) { console.error('Tasks fetch error:', error.message); return 0; }
     if (!tasks?.length) return 0;
+    console.log(`[reminders] fetched ${tasks.length} tasks with reminder`);
 
     let sent = 0;
     for (const task of tasks) {
         const offset = REMINDER_OFFSETS_MINUTES[task.reminder];
         if (!offset) continue;
 
-        const taskDt = new Date(`${task.select_date}T${task.select_time}Z`);
+        const { data: profile } = await supabase
+            .from('profiles_notifications')
+            .select('fcm_token, timezone')
+            .eq('id', task.user_id)
+            .maybeSingle();
+        if (!profile?.fcm_token) continue;
+
+        const tz = profile.timezone || 'UTC';
+        const taskDt = parseTaskDateTimeInTimezone(task.select_date, task.select_time, tz);
         const reminderTime = new Date(taskDt.getTime() - offset * 60_000);
-        if (reminderTime < windowStart || reminderTime > windowEnd) continue;
+        if (reminderTime < windowStart || reminderTime > windowEnd) {
+            if (Math.abs(reminderTime - now) < 10 * 60_000) {
+                console.log(`[reminders] task=${task.id} skip: outside window tz=${tz} taskDt=${taskDt.toISOString()} reminderTime=${reminderTime.toISOString()}`);
+            }
+            continue;
+        }
 
         const { data: existing } = await supabase
             .from('notifications')
@@ -234,17 +319,10 @@ async function processTaskReminders(supabase, accessToken, projectId) {
             .maybeSingle();
         if (existing) continue;
 
-        const { data: profile } = await supabase
-            .from('profiles_notifications')
-            .select('fcm_token')
-            .eq('id', task.user_id)
-            .maybeSingle();
-        if (!profile?.fcm_token) continue;
-
         const title = '⏰ Reminder';
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body);
+        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
         if (ok) {
             await logNotification(supabase, task.user_id, 'task_reminder', task.id, title, body);
             sent++;
@@ -256,6 +334,7 @@ async function processTaskReminders(supabase, accessToken, projectId) {
 
 async function processOverdueTasks(supabase, accessToken, projectId) {
     const now = new Date();
+    console.log(`[overdue] now=${now.toISOString()}`);
 
     const { data: tasks, error } = await supabase
         .from('tasks')
@@ -266,10 +345,19 @@ async function processOverdueTasks(supabase, accessToken, projectId) {
 
     if (error) { console.error('Tasks fetch error:', error.message); return 0; }
     if (!tasks?.length) return 0;
+    console.log(`[overdue] fetched ${tasks.length} incomplete tasks`);
 
     let sent = 0;
     for (const task of tasks) {
-        const taskDt = new Date(`${task.select_date}T${task.select_time}Z`);
+        const { data: profile } = await supabase
+            .from('profiles_notifications')
+            .select('fcm_token, timezone')
+            .eq('id', task.user_id)
+            .maybeSingle();
+        if (!profile?.fcm_token) continue;
+
+        const tz = profile.timezone || 'UTC';
+        const taskDt = parseTaskDateTimeInTimezone(task.select_date, task.select_time, tz);
         const overdueTime = new Date(taskDt.getTime() + 60 * 60_000);
         const diff = now.getTime() - overdueTime.getTime();
         if (diff < 0 || diff > HOURS_24) continue;
@@ -284,17 +372,10 @@ async function processOverdueTasks(supabase, accessToken, projectId) {
             .maybeSingle();
         if (existing) continue;
 
-        const { data: profile } = await supabase
-            .from('profiles_notifications')
-            .select('fcm_token')
-            .eq('id', task.user_id)
-            .maybeSingle();
-        if (!profile?.fcm_token) continue;
-
         const title = pickRandom(OVERDUE_TITLES);
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body);
+        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
         if (ok) {
             await logNotification(supabase, task.user_id, 'overdue_task', task.id, title, body);
             sent++;
@@ -370,7 +451,7 @@ async function processJournalNudge(supabase, accessToken, projectId) {
 
             const nudgeText = pickRandom(NUDGE_COPIES);
 
-            const ok = await sendToUser(accessToken, projectId, profile.fcm_token, nudgeText, '');
+            const ok = await sendToUser(accessToken, projectId, profile.fcm_token, nudgeText, '', profile.id, supabase);
             if (ok) {
                 await logNotification(supabase, profile.id, 'journal_nudge', null, nudgeText, '');
                 sent++;
@@ -415,23 +496,25 @@ Deno.serve(async (req) => {
             { auth: { persistSession: false, autoRefreshToken: false } },
         );
 
-        const fcmAccountJson = Deno.env.get('FCM_SERVICE_ACCOUNT');
-        const fcmProjectId = Deno.env.get('FCM_PROJECT_ID');
-        if (!fcmAccountJson || !fcmProjectId) {
-            return json({ success: false, error: 'FCM_SERVICE_ACCOUNT or FCM_PROJECT_ID not configured' }, 500);
+        const serviceAccount = getServiceAccount();
+        if (!serviceAccount) {
+            return json({
+                success: false,
+                error: 'Configure FCM_SERVICE_ACCOUNT (full JSON) OR FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY',
+            }, 500);
         }
 
-        const serviceAccount = JSON.parse(fcmAccountJson);
+        const projectId = serviceAccount.project_id;
         const accessToken = await getAccessToken(serviceAccount);
 
         let processed = 0;
 
         if (type === 'task_reminders') {
-            processed = await processTaskReminders(supabase, accessToken, fcmProjectId);
+            processed = await processTaskReminders(supabase, accessToken, projectId);
         } else if (type === 'overdue_tasks') {
-            processed = await processOverdueTasks(supabase, accessToken, fcmProjectId);
+            processed = await processOverdueTasks(supabase, accessToken, projectId);
         } else if (type === 'journal_nudge') {
-            processed = await processJournalNudge(supabase, accessToken, fcmProjectId);
+            processed = await processJournalNudge(supabase, accessToken, projectId);
         }
 
         console.log(`[${type}] Done. Sent: ${processed}`);
