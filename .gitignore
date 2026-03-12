@@ -9,6 +9,10 @@ pnpm-lock.yaml
 .env.local
 .env.production
 
+# Firebase credentials (service account)
+firebase.json
+*-firebase-adminsdk-*.json
+
 # Logs
 logs/
 *.log
