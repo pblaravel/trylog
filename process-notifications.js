@@ -43,7 +43,7 @@ function getServiceAccount() {
                 return {
                     project_id: parsed.project_id,
                     client_email: parsed.client_email,
-                    private_key: parsed.private_key.replace(/\\n/g, '\n'),
+                    private_key: parsed.private_key,
                 };
             }
         } catch { /* fallback to separate vars */ }
@@ -60,24 +60,22 @@ function getServiceAccount() {
 
 // ─── FCM HTTP v1 ────────────────────────────────────────────
 
-async function getAccessToken(serviceAccount) {
-    const privateKey = (serviceAccount.private_key || '').replace(/\\n/g, '\n');
-    if (!privateKey || !privateKey.includes('BEGIN PRIVATE KEY')) {
-        throw new Error('Invalid private_key: too short or missing. Check FIREBASE_PRIVATE_KEY.');
-    }
-
+function getAccessToken(serviceAccount) {
     const jwtClient = new JWT({
-        email: serviceAccount.client_email,
-        key: privateKey,
-        scopes: ['https://www.googleapis.com/auth/firebase.messaging'],
+      email: serviceAccount.client_email,
+      key: serviceAccount.private_key,
+      scopes: ['https://www.googleapis.com/auth/firebase.messaging'],
     });
-
-    const tokens = await jwtClient.authorize();
-    if (!tokens?.access_token) {
-        throw new Error('FCM auth failed: no access token');
-    }
-    return tokens.access_token;
-}
+    return new Promise((resolve, reject) => {
+      jwtClient.authorize((err, tokens) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(tokens.access_token);
+      });
+    });
+  }
 
 async function sendFcm(accessToken, projectId, fcmToken, title, body) {
     if (!accessToken || typeof accessToken !== 'string') {

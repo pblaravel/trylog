@@ -1,0 +1,11 @@
+{
+  "name": "trylog",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test-fcm": "node test-fcm-curl.js"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.0.0"
+  }
+}
