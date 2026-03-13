@@ -51,7 +51,7 @@ function getServiceAccount() {
 
     const projectId = Deno.env.get('FIREBASE_PROJECT_ID');
     const clientEmail = Deno.env.get('FIREBASE_CLIENT_EMAIL');
-    const privateKey = Deno.env.get('FIREBASE_PRIVATE_KEY')?.replace(/\\n/g, '\n');
+    const privateKey = Deno.env.get('FIREBASE_PRIVATE_KEY');
     if (projectId && clientEmail && privateKey) {
         return { project_id: projectId, client_email: clientEmail, private_key: privateKey };
     }
