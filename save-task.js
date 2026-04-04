@@ -10,6 +10,7 @@ import {
  *
  * Повторяемость (repeat): при создании задачи с repeat !== "No Repeats" и заданным end_date
  * создаются дочерние задачи в интервале [selectDate, end_date] с parent_id = id родителя.
+ * Подзадачи дублируются для каждого дочернего экземпляра (как у родителя на дату selectDate).
  * Поддерживаются: Daily, Weekly, Bi-weekly, Monthly, Annually; для Custom — опционально repeatIntervalDays (число дней).
  *
  * При редактировании: если repeat меняется на "No Repeats" — удаляются все будущие дочерние по parent_id;
@@ -422,6 +423,30 @@ Deno.serve(async (req) => {
         const taskIdForUpdate = validateUuid(payloadId ?? payloadTaskId);
         const isUpdate = taskIdForUpdate !== null;
 
+        let normalizedSubtasks = [];
+        if (!isUpdate && Array.isArray(subtasks)) {
+            normalizedSubtasks = subtasks
+                .map((raw) => {
+                    if (typeof raw === 'string') {
+                        const trimmed = raw.trim();
+                        return trimmed.length > 0 ? {
+                            title: trimmed,
+                            isCompleted: false
+                        } : null;
+                    }
+                    if (raw && typeof raw === 'object' && typeof raw.title === 'string') {
+                        const trimmed = raw.title.trim();
+                        if (trimmed.length === 0) return null;
+                        return {
+                            title: trimmed,
+                            isCompleted: Boolean(raw.isCompleted),
+                        };
+                    }
+                    return null;
+                })
+                .filter(Boolean);
+        }
+
         const taskPayload = {
             title: title.trim(),
             description: typeof description === 'string' ? description.trim() || null : null,
@@ -548,10 +573,26 @@ Deno.serve(async (req) => {
                     select_date: date
                 }));
                 const {
+                    data: insertedChildren,
                     error: childrenError
-                } = await supabaseClient.from('tasks').insert(childInserts);
+                } = await supabaseClient.from('tasks').insert(childInserts).select('id');
                 if (childrenError) {
                     console.warn('⚠️ Error creating repeat child tasks:', childrenError.message);
+                } else if (normalizedSubtasks.length > 0 && insertedChildren?.length) {
+                    const subtasksForChildren = insertedChildren.flatMap((child) =>
+                        normalizedSubtasks.map((item) => ({
+                            task_id: child.id,
+                            user_id: user.id,
+                            title: item.title,
+                            is_completed: item.isCompleted,
+                        }))
+                    );
+                    const {
+                        error: childSubtasksError
+                    } = await supabaseClient.from('subtasks').insert(subtasksForChildren);
+                    if (childSubtasksError) {
+                        console.warn('⚠️ Error copying subtasks to repeat tasks:', childSubtasksError.message);
+                    }
                 }
             }
         }
@@ -855,29 +896,7 @@ Deno.serve(async (req) => {
                 );
             }
 
-            // Handle subtasks - параллельно
-            const normalizedSubtasks = Array.isArray(subtasks) ?
-                subtasks
-                .map((raw) => {
-                    if (typeof raw === 'string') {
-                        const trimmed = raw.trim();
-                        return trimmed.length > 0 ? {
-                            title: trimmed,
-                            isCompleted: false
-                        } : null;
-                    }
-                    if (raw && typeof raw === 'object' && typeof raw.title === 'string') {
-                        const trimmed = raw.title.trim();
-                        if (trimmed.length === 0) return null;
-                        return {
-                            title: trimmed,
-                            isCompleted: Boolean(raw.isCompleted),
-                        };
-                    }
-                    return null;
-                })
-                .filter(Boolean) : [];
-
+            // Handle subtasks - параллельно (normalizedSubtasks уже посчитан при создании)
             if (normalizedSubtasks.length > 0) {
                 operations.push(
                     (async () => {
