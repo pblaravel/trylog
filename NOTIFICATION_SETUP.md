@@ -83,9 +83,12 @@ await supabase.functions.invoke("update-notification-state", options: .init(
 
 | Тип | Триггер | Расписание |
 |-----|---------|------------|
-| **Task Reminder** | Время напоминания задачи | Каждую минуту |
+| **Task Reminder** | За N минут/часов до дедлайна (если reminder ≠ noReminders) | Каждую минуту |
+| **Task Due** | В момент дедлайна (`select_date` + `select_time` в TZ пользователя), даже без reminder | Каждую минуту (тот же cron, что reminders) |
 | **Overdue Task** | +1 час после дедлайна | Каждые 15 минут |
 | **Journal Nudge** | 72ч без записей в дневнике | 18:00–20:30 по локальному времени, каждый час |
+
+Если в БД уже применяли старую миграцию без `task_due`, выполните `migration-notifications-task-due.sql` в SQL Editor.
 
 ## Важно: APNS для iOS
 
@@ -117,7 +120,7 @@ curl -X POST "https://vazeilznifsjxquigwpc.supabase.co/functions/v1/process-noti
 
 В логах при каждом запуске:
 - `[reminders] now=... window=[...]` — текущее время и окно поиска
-- `[reminders] fetched N tasks` — сколько задач с напоминаниями
+- `[reminders] fetched N tasks` — сколько задач с напоминаниями; `[task_due]` — дедлайн в текущей минуте
 - `[reminders] task=X skip: outside window` — задача пропущена (вне окна, проверьте timezone)
 - `Task reminder sent: task=X` — уведомление отправлено
 

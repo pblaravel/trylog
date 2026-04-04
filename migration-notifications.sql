@@ -17,7 +17,7 @@ ALTER TABLE notifications
 -- Ограничение на допустимые типы
 ALTER TABLE notifications
     ADD CONSTRAINT notifications_type_check
-    CHECK (type IN ('task_reminder', 'overdue_task', 'journal_nudge'));
+    CHECK (type IN ('task_reminder', 'task_due', 'overdue_task', 'journal_nudge'));
 
 -- Индексы для быстрой дедупликации
 CREATE INDEX IF NOT EXISTS idx_notifications_user_type
