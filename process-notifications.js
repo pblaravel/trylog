@@ -77,12 +77,24 @@ function getAccessToken(serviceAccount) {
     });
   }
 
-async function sendFcm(accessToken, projectId, fcmToken, title, body) {
+/** Data payload: все значения — строки (требование FCM и клиентского контракта). */
+function stringifyDataPayload(data) {
+    if (!data || typeof data !== 'object') return null;
+    const out = {};
+    for (const [k, v] of Object.entries(data)) {
+        if (v === undefined || v === null) continue;
+        out[k] = String(v);
+    }
+    return out;
+}
+
+async function sendFcm(accessToken, projectId, fcmToken, title, body, data = null) {
     if (!accessToken || typeof accessToken !== 'string') {
         console.error('sendFcm: accessToken is empty or invalid');
         return { ok: false, invalidToken: false };
     }
 
+    const dataPayload = stringifyDataPayload(data);
     const message = {
         message: {
             token: fcmToken,
@@ -92,6 +104,12 @@ async function sendFcm(accessToken, projectId, fcmToken, title, body) {
             },
         },
     };
+    if (dataPayload && Object.keys(dataPayload).length > 0) {
+        message.message.data = dataPayload;
+        message.message.android = {
+            notification: { click_action: dataPayload.click_action ?? 'FLUTTER_NOTIFICATION_CLICK' },
+        };
+    }
 
     const resp = await fetch(
         `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`,
@@ -118,10 +136,10 @@ async function sendFcm(accessToken, projectId, fcmToken, title, body) {
     return { ok: true };
 }
 
-async function sendToUser(accessToken, projectId, fcmToken, title, body, userId, supabase) {
+async function sendToUser(accessToken, projectId, fcmToken, title, body, userId, supabase, data = null) {
     if (!fcmToken) return false;
     try {
-        const result = await sendFcm(accessToken, projectId, fcmToken, title, body);
+        const result = await sendFcm(accessToken, projectId, fcmToken, title, body, data);
         if (result.invalidToken && userId && supabase) {
             const { error } = await supabase
                 .from('profiles_notifications')
@@ -147,6 +165,22 @@ const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const MAX_BODY_LENGTH = 100;
 const trimText = (text) =>
     text.length > MAX_BODY_LENGTH ? text.slice(0, MAX_BODY_LENGTH - 1) + '…' : text;
+
+/** Контракт клиента для push по задачам: type всегда task_reminder, target=task, task_id обязателен. */
+function buildTaskPushData(taskId) {
+    const id = taskId != null ? String(taskId).trim() : '';
+    if (!id) {
+        console.error('buildTaskPushData: missing task_id, invalid payload');
+        return null;
+    }
+    return {
+        type: 'task_reminder',
+        target: 'task',
+        task_id: id,
+        message_id: crypto.randomUUID(),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+    };
+}
 
 const HOURS_72 = 72 * 60 * 60 * 1000;
 const HOURS_24 = 24 * 60 * 60 * 1000;
@@ -283,7 +317,19 @@ async function processTaskReminders(supabase, accessToken, projectId) {
         const title = '⏰ Reminder';
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
+        const pushData = buildTaskPushData(task.id);
+        if (!pushData) continue;
+
+        const ok = await sendToUser(
+            accessToken,
+            projectId,
+            profile.fcm_token,
+            title,
+            body,
+            task.user_id,
+            supabase,
+            pushData,
+        );
         if (ok) {
             await logNotification(supabase, task.user_id, 'task_reminder', task.id, title, body);
             sent++;
@@ -347,7 +393,19 @@ async function processTaskDue(supabase, accessToken, projectId) {
         const title = '📅 Task due';
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
+        const pushData = buildTaskPushData(task.id);
+        if (!pushData) continue;
+
+        const ok = await sendToUser(
+            accessToken,
+            projectId,
+            profile.fcm_token,
+            title,
+            body,
+            task.user_id,
+            supabase,
+            pushData,
+        );
         if (ok) {
             await logNotification(supabase, task.user_id, 'task_due', task.id, title, body);
             sent++;
@@ -400,7 +458,19 @@ async function processOverdueTasks(supabase, accessToken, projectId) {
         const title = pickRandom(OVERDUE_TITLES);
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
+        const pushData = buildTaskPushData(task.id);
+        if (!pushData) continue;
+
+        const ok = await sendToUser(
+            accessToken,
+            projectId,
+            profile.fcm_token,
+            title,
+            body,
+            task.user_id,
+            supabase,
+            pushData,
+        );
         if (ok) {
             await logNotification(supabase, task.user_id, 'overdue_task', task.id, title, body);
             sent++;
