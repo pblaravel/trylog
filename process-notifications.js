@@ -7,7 +7,7 @@ import { JWT } from 'npm:google-auth-library@9';
  *
  * Единая cron-функция для обработки всех типов уведомлений.
  * Вызывается pg_cron с параметром type:
- *   - task_reminders  (каждую минуту)
+ *   - task_reminders  (каждую минуту: напоминания до дедлайна + push в момент дедлайна)
  *   - overdue_tasks   (каждые 15 минут)
  *   - journal_nudge   (каждый час)
  *
@@ -293,6 +293,70 @@ async function processTaskReminders(supabase, accessToken, projectId) {
     return sent;
 }
 
+/** Push в момент наступления срока (select_date + select_time в TZ пользователя), независимо от reminder */
+async function processTaskDue(supabase, accessToken, projectId) {
+    const now = new Date();
+    const windowStart = new Date(now.getTime() - 180_000);
+    const windowEnd = new Date(now.getTime() + 60_000);
+    console.log(`[task_due] now=${now.toISOString()} window=[${windowStart.toISOString()} .. ${windowEnd.toISOString()}]`);
+
+    const { data: tasks, error } = await supabase
+        .from('tasks')
+        .select('id, user_id, title, select_date, select_time')
+        .eq('is_completed', false)
+        .not('select_date', 'is', null)
+        .not('select_time', 'is', null);
+
+    if (error) {
+        console.error('[task_due] Tasks fetch error:', error.message);
+        return 0;
+    }
+    if (!tasks?.length) return 0;
+    console.log(`[task_due] fetched ${tasks.length} tasks with date+time`);
+
+    let sent = 0;
+    for (const task of tasks) {
+        const { data: profile } = await supabase
+            .from('profiles_notifications')
+            .select('fcm_token, timezone')
+            .eq('id', task.user_id)
+            .maybeSingle();
+        if (!profile?.fcm_token) continue;
+
+        const tz = profile.timezone || 'UTC';
+        const taskDt = parseTaskDateTimeInTimezone(task.select_date, task.select_time, tz);
+        if (taskDt < windowStart || taskDt > windowEnd) {
+            if (Math.abs(taskDt.getTime() - now.getTime()) < 10 * 60_000) {
+                console.log(
+                    `[task_due] task=${task.id} skip: outside window tz=${tz} taskDt=${taskDt.toISOString()}`,
+                );
+            }
+            continue;
+        }
+
+        const { data: existing } = await supabase
+            .from('notifications')
+            .select('id')
+            .eq('user_id', task.user_id)
+            .eq('type', 'task_due')
+            .eq('reference_id', task.id)
+            .limit(1)
+            .maybeSingle();
+        if (existing) continue;
+
+        const title = '📅 Task due';
+        const body = trimText(task.title);
+
+        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
+        if (ok) {
+            await logNotification(supabase, task.user_id, 'task_due', task.id, title, body);
+            sent++;
+            console.log(`Task due notification sent: task=${task.id}`);
+        }
+    }
+    return sent;
+}
+
 async function processOverdueTasks(supabase, accessToken, projectId) {
     const now = new Date();
     console.log(`[overdue] now=${now.toISOString()}`);
@@ -404,7 +468,7 @@ async function processJournalNudge(supabase, accessToken, projectId) {
                 .from('notifications')
                 .select('id')
                 .eq('user_id', profile.id)
-                .in('type', ['task_reminder', 'overdue_task'])
+                .in('type', ['task_reminder', 'task_due', 'overdue_task'])
                 .gte('created_at', `${todayStr}T00:00:00Z`)
                 .limit(1)
                 .maybeSingle();
@@ -471,7 +535,9 @@ Deno.serve(async (req) => {
         let processed = 0;
 
         if (type === 'task_reminders') {
-            processed = await processTaskReminders(supabase, accessToken, projectId);
+            const reminders = await processTaskReminders(supabase, accessToken, projectId);
+            const due = await processTaskDue(supabase, accessToken, projectId);
+            processed = reminders + due;
         } else if (type === 'overdue_tasks') {
             processed = await processOverdueTasks(supabase, accessToken, projectId);
         } else if (type === 'journal_nudge') {
