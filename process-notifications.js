@@ -185,6 +185,14 @@ function buildTaskPushData(taskId) {
 const HOURS_72 = 72 * 60 * 60 * 1000;
 const HOURS_24 = 24 * 60 * 60 * 1000;
 
+/**
+ * Окно «сработало в эту минуту» относительно фактического времени запуска cron.
+ * Раньше было [now-3m, now+1m] — при очереди pg_net / холодном старте Edge легко
+ * опоздать на 4–5+ минут и навсегда пропустить reminder / task_due для этой задачи.
+ */
+const MATCH_WINDOW_PAST_MS = 15 * 60_000;
+const MATCH_WINDOW_FUTURE_MS = 2 * 60_000;
+
 const REMINDER_OFFSETS_MINUTES = {
     fiveMinutes: 5,
     tenMinutes: 10,
@@ -224,20 +232,67 @@ function getUserLocalHour(utcDate, timezone) {
     }
 }
 
-/** Парсит date+time в timezone пользователя и возвращает UTC Date */
+/**
+ * Локальная дата+время в IANA-зоне → UTC (через Intl, без старой эвристики «полдень UTC»).
+ * Ищем совпадение по минутам в окне ±14ч от полуночи UTC календарного дня — покрывает любые офсеты и DST.
+ */
 function parseTaskDateTimeInTimezone(selectDate, selectTime, timezone) {
-    const timeStr = String(selectTime).length === 5 ? `${selectTime}:00` : selectTime;
-    const tempUtc = new Date(`${selectDate}T${timeStr}Z`);
-    const noonUtc = new Date(`${selectDate}T12:00:00Z`);
+    const tz = timezone && String(timezone).trim() ? String(timezone).trim() : 'UTC';
+    const [y, mo, da] = String(selectDate).split('-').map((x) => parseInt(x, 10));
+    const rawTime = String(selectTime).trim();
+    const timeNorm = rawTime.length === 5 ? `${rawTime}:00` : rawTime;
+    const tp = timeNorm.split(':').map((x) => parseInt(x, 10));
+    const hhN = tp[0] ?? 0;
+    const mmN = tp[1] ?? 0;
+    const ssN = tp[2] ?? 0;
+
+    if (!y || !mo || !da) {
+        return new Date(`${selectDate}T${timeNorm}Z`);
+    }
+
     try {
-        const hourParts = new Intl.DateTimeFormat('en-US', {
-            timeZone: timezone, hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
-        }).formatToParts(noonUtc);
-        const h = parseInt(hourParts.find((p) => p.type === 'hour')?.value ?? '12', 10);
-        const offsetHours = h - 12;
-        return new Date(tempUtc.getTime() - offsetHours * 60 * 60 * 1000);
-    } catch {
-        return tempUtc;
+        const dtf = new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+        });
+
+        const readLocal = (utcMs) => {
+            const parts = dtf.formatToParts(new Date(utcMs));
+            const g = (type) => parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10);
+            return { y: g('year'), mo: g('month'), d: g('day'), h: g('hour'), mi: g('minute'), s: g('second') };
+        };
+
+        const matchesMinute = (utcMs) => {
+            const p = readLocal(utcMs);
+            return p.y === y && p.mo === mo && p.d === da && p.h === hhN && p.mi === mmN;
+        };
+
+        const dayMidUtc = Date.UTC(y, mo - 1, da, 0, 0, 0);
+        const from = dayMidUtc - 14 * 60 * 60 * 1000;
+        const to = dayMidUtc + 38 * 60 * 60 * 1000;
+
+        for (let t = from; t <= to; t += 60_000) {
+            if (!matchesMinute(t)) continue;
+            for (let s = 0; s < 60; s++) {
+                const ms = t + s * 1000;
+                const p = readLocal(ms);
+                if (p.y === y && p.mo === mo && p.d === da && p.h === hhN && p.mi === mmN && p.s === ssN) {
+                    return new Date(ms);
+                }
+            }
+        }
+
+        console.error(`parseTaskDateTimeInTimezone: no instant for ${selectDate} ${timeNorm} tz=${tz}`);
+        return new Date(`${selectDate}T${timeNorm}Z`);
+    } catch (e) {
+        console.error('parseTaskDateTimeInTimezone error:', e?.message ?? e);
+        return new Date(`${selectDate}T${timeNorm}Z`);
     }
 }
 
@@ -266,8 +321,8 @@ async function logNotification(supabase, userId, type, referenceId, title, body)
 
 async function processTaskReminders(supabase, accessToken, projectId) {
     const now = new Date();
-    const windowStart = new Date(now.getTime() - 180_000);
-    const windowEnd = new Date(now.getTime() + 60_000);
+    const windowStart = new Date(now.getTime() - MATCH_WINDOW_PAST_MS);
+    const windowEnd = new Date(now.getTime() + MATCH_WINDOW_FUTURE_MS);
     console.log(`[reminders] now=${now.toISOString()} window=[${windowStart.toISOString()} .. ${windowEnd.toISOString()}]`);
 
     const { data: tasks, error } = await supabase
@@ -298,7 +353,7 @@ async function processTaskReminders(supabase, accessToken, projectId) {
         const taskDt = parseTaskDateTimeInTimezone(task.select_date, task.select_time, tz);
         const reminderTime = new Date(taskDt.getTime() - offset * 60_000);
         if (reminderTime < windowStart || reminderTime > windowEnd) {
-            if (Math.abs(reminderTime - now) < 10 * 60_000) {
+            if (Math.abs(reminderTime.getTime() - now.getTime()) < MATCH_WINDOW_PAST_MS) {
                 console.log(`[reminders] task=${task.id} skip: outside window tz=${tz} taskDt=${taskDt.toISOString()} reminderTime=${reminderTime.toISOString()}`);
             }
             continue;
@@ -342,8 +397,8 @@ async function processTaskReminders(supabase, accessToken, projectId) {
 /** Push в момент наступления срока (select_date + select_time в TZ пользователя), независимо от reminder */
 async function processTaskDue(supabase, accessToken, projectId) {
     const now = new Date();
-    const windowStart = new Date(now.getTime() - 180_000);
-    const windowEnd = new Date(now.getTime() + 60_000);
+    const windowStart = new Date(now.getTime() - MATCH_WINDOW_PAST_MS);
+    const windowEnd = new Date(now.getTime() + MATCH_WINDOW_FUTURE_MS);
     console.log(`[task_due] now=${now.toISOString()} window=[${windowStart.toISOString()} .. ${windowEnd.toISOString()}]`);
 
     const { data: tasks, error } = await supabase
@@ -372,7 +427,7 @@ async function processTaskDue(supabase, accessToken, projectId) {
         const tz = profile.timezone || 'UTC';
         const taskDt = parseTaskDateTimeInTimezone(task.select_date, task.select_time, tz);
         if (taskDt < windowStart || taskDt > windowEnd) {
-            if (Math.abs(taskDt.getTime() - now.getTime()) < 10 * 60_000) {
+            if (Math.abs(taskDt.getTime() - now.getTime()) < MATCH_WINDOW_PAST_MS) {
                 console.log(
                     `[task_due] task=${task.id} skip: outside window tz=${tz} taskDt=${taskDt.toISOString()}`,
                 );
