@@ -77,12 +77,24 @@ function getAccessToken(serviceAccount) {
     });
   }
 
-async function sendFcm(accessToken, projectId, fcmToken, title, body) {
+/** Data payload: все значения — строки (требование FCM и клиентского контракта). */
+function stringifyDataPayload(data) {
+    if (!data || typeof data !== 'object') return null;
+    const out = {};
+    for (const [k, v] of Object.entries(data)) {
+        if (v === undefined || v === null) continue;
+        out[k] = String(v);
+    }
+    return out;
+}
+
+async function sendFcm(accessToken, projectId, fcmToken, title, body, data = null) {
     if (!accessToken || typeof accessToken !== 'string') {
         console.error('sendFcm: accessToken is empty or invalid');
         return { ok: false, invalidToken: false };
     }
 
+    const dataPayload = stringifyDataPayload(data);
     const message = {
         message: {
             token: fcmToken,
@@ -92,6 +104,12 @@ async function sendFcm(accessToken, projectId, fcmToken, title, body) {
             },
         },
     };
+    if (dataPayload && Object.keys(dataPayload).length > 0) {
+        message.message.data = dataPayload;
+        message.message.android = {
+            notification: { click_action: dataPayload.click_action ?? 'FLUTTER_NOTIFICATION_CLICK' },
+        };
+    }
 
     const resp = await fetch(
         `https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`,
@@ -118,10 +136,10 @@ async function sendFcm(accessToken, projectId, fcmToken, title, body) {
     return { ok: true };
 }
 
-async function sendToUser(accessToken, projectId, fcmToken, title, body, userId, supabase) {
+async function sendToUser(accessToken, projectId, fcmToken, title, body, userId, supabase, data = null) {
     if (!fcmToken) return false;
     try {
-        const result = await sendFcm(accessToken, projectId, fcmToken, title, body);
+        const result = await sendFcm(accessToken, projectId, fcmToken, title, body, data);
         if (result.invalidToken && userId && supabase) {
             const { error } = await supabase
                 .from('profiles_notifications')
@@ -148,8 +166,32 @@ const MAX_BODY_LENGTH = 100;
 const trimText = (text) =>
     text.length > MAX_BODY_LENGTH ? text.slice(0, MAX_BODY_LENGTH - 1) + '…' : text;
 
+/** Контракт клиента для push по задачам: type всегда task_reminder, target=task, task_id обязателен. */
+function buildTaskPushData(taskId) {
+    const id = taskId != null ? String(taskId).trim() : '';
+    if (!id) {
+        console.error('buildTaskPushData: missing task_id, invalid payload');
+        return null;
+    }
+    return {
+        type: 'task_reminder',
+        target: 'task',
+        task_id: id,
+        message_id: crypto.randomUUID(),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+    };
+}
+
 const HOURS_72 = 72 * 60 * 60 * 1000;
 const HOURS_24 = 24 * 60 * 60 * 1000;
+
+/**
+ * Окно «сработало в эту минуту» относительно фактического времени запуска cron.
+ * Раньше было [now-3m, now+1m] — при очереди pg_net / холодном старте Edge легко
+ * опоздать на 4–5+ минут и навсегда пропустить reminder / task_due для этой задачи.
+ */
+const MATCH_WINDOW_PAST_MS = 15 * 60_000;
+const MATCH_WINDOW_FUTURE_MS = 2 * 60_000;
 
 const REMINDER_OFFSETS_MINUTES = {
     fiveMinutes: 5,
@@ -190,20 +232,67 @@ function getUserLocalHour(utcDate, timezone) {
     }
 }
 
-/** Парсит date+time в timezone пользователя и возвращает UTC Date */
+/**
+ * Локальная дата+время в IANA-зоне → UTC (через Intl, без старой эвристики «полдень UTC»).
+ * Ищем совпадение по минутам в окне ±14ч от полуночи UTC календарного дня — покрывает любые офсеты и DST.
+ */
 function parseTaskDateTimeInTimezone(selectDate, selectTime, timezone) {
-    const timeStr = String(selectTime).length === 5 ? `${selectTime}:00` : selectTime;
-    const tempUtc = new Date(`${selectDate}T${timeStr}Z`);
-    const noonUtc = new Date(`${selectDate}T12:00:00Z`);
+    const tz = timezone && String(timezone).trim() ? String(timezone).trim() : 'UTC';
+    const [y, mo, da] = String(selectDate).split('-').map((x) => parseInt(x, 10));
+    const rawTime = String(selectTime).trim();
+    const timeNorm = rawTime.length === 5 ? `${rawTime}:00` : rawTime;
+    const tp = timeNorm.split(':').map((x) => parseInt(x, 10));
+    const hhN = tp[0] ?? 0;
+    const mmN = tp[1] ?? 0;
+    const ssN = tp[2] ?? 0;
+
+    if (!y || !mo || !da) {
+        return new Date(`${selectDate}T${timeNorm}Z`);
+    }
+
     try {
-        const hourParts = new Intl.DateTimeFormat('en-US', {
-            timeZone: timezone, hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false,
-        }).formatToParts(noonUtc);
-        const h = parseInt(hourParts.find((p) => p.type === 'hour')?.value ?? '12', 10);
-        const offsetHours = h - 12;
-        return new Date(tempUtc.getTime() - offsetHours * 60 * 60 * 1000);
-    } catch {
-        return tempUtc;
+        const dtf = new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+        });
+
+        const readLocal = (utcMs) => {
+            const parts = dtf.formatToParts(new Date(utcMs));
+            const g = (type) => parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10);
+            return { y: g('year'), mo: g('month'), d: g('day'), h: g('hour'), mi: g('minute'), s: g('second') };
+        };
+
+        const matchesMinute = (utcMs) => {
+            const p = readLocal(utcMs);
+            return p.y === y && p.mo === mo && p.d === da && p.h === hhN && p.mi === mmN;
+        };
+
+        const dayMidUtc = Date.UTC(y, mo - 1, da, 0, 0, 0);
+        const from = dayMidUtc - 14 * 60 * 60 * 1000;
+        const to = dayMidUtc + 38 * 60 * 60 * 1000;
+
+        for (let t = from; t <= to; t += 60_000) {
+            if (!matchesMinute(t)) continue;
+            for (let s = 0; s < 60; s++) {
+                const ms = t + s * 1000;
+                const p = readLocal(ms);
+                if (p.y === y && p.mo === mo && p.d === da && p.h === hhN && p.mi === mmN && p.s === ssN) {
+                    return new Date(ms);
+                }
+            }
+        }
+
+        console.error(`parseTaskDateTimeInTimezone: no instant for ${selectDate} ${timeNorm} tz=${tz}`);
+        return new Date(`${selectDate}T${timeNorm}Z`);
+    } catch (e) {
+        console.error('parseTaskDateTimeInTimezone error:', e?.message ?? e);
+        return new Date(`${selectDate}T${timeNorm}Z`);
     }
 }
 
@@ -232,8 +321,8 @@ async function logNotification(supabase, userId, type, referenceId, title, body)
 
 async function processTaskReminders(supabase, accessToken, projectId) {
     const now = new Date();
-    const windowStart = new Date(now.getTime() - 180_000);
-    const windowEnd = new Date(now.getTime() + 60_000);
+    const windowStart = new Date(now.getTime() - MATCH_WINDOW_PAST_MS);
+    const windowEnd = new Date(now.getTime() + MATCH_WINDOW_FUTURE_MS);
     console.log(`[reminders] now=${now.toISOString()} window=[${windowStart.toISOString()} .. ${windowEnd.toISOString()}]`);
 
     const { data: tasks, error } = await supabase
@@ -264,7 +353,7 @@ async function processTaskReminders(supabase, accessToken, projectId) {
         const taskDt = parseTaskDateTimeInTimezone(task.select_date, task.select_time, tz);
         const reminderTime = new Date(taskDt.getTime() - offset * 60_000);
         if (reminderTime < windowStart || reminderTime > windowEnd) {
-            if (Math.abs(reminderTime - now) < 10 * 60_000) {
+            if (Math.abs(reminderTime.getTime() - now.getTime()) < MATCH_WINDOW_PAST_MS) {
                 console.log(`[reminders] task=${task.id} skip: outside window tz=${tz} taskDt=${taskDt.toISOString()} reminderTime=${reminderTime.toISOString()}`);
             }
             continue;
@@ -283,7 +372,19 @@ async function processTaskReminders(supabase, accessToken, projectId) {
         const title = '⏰ Reminder';
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
+        const pushData = buildTaskPushData(task.id);
+        if (!pushData) continue;
+
+        const ok = await sendToUser(
+            accessToken,
+            projectId,
+            profile.fcm_token,
+            title,
+            body,
+            task.user_id,
+            supabase,
+            pushData,
+        );
         if (ok) {
             await logNotification(supabase, task.user_id, 'task_reminder', task.id, title, body);
             sent++;
@@ -296,8 +397,8 @@ async function processTaskReminders(supabase, accessToken, projectId) {
 /** Push в момент наступления срока (select_date + select_time в TZ пользователя), независимо от reminder */
 async function processTaskDue(supabase, accessToken, projectId) {
     const now = new Date();
-    const windowStart = new Date(now.getTime() - 180_000);
-    const windowEnd = new Date(now.getTime() + 60_000);
+    const windowStart = new Date(now.getTime() - MATCH_WINDOW_PAST_MS);
+    const windowEnd = new Date(now.getTime() + MATCH_WINDOW_FUTURE_MS);
     console.log(`[task_due] now=${now.toISOString()} window=[${windowStart.toISOString()} .. ${windowEnd.toISOString()}]`);
 
     const { data: tasks, error } = await supabase
@@ -326,7 +427,7 @@ async function processTaskDue(supabase, accessToken, projectId) {
         const tz = profile.timezone || 'UTC';
         const taskDt = parseTaskDateTimeInTimezone(task.select_date, task.select_time, tz);
         if (taskDt < windowStart || taskDt > windowEnd) {
-            if (Math.abs(taskDt.getTime() - now.getTime()) < 10 * 60_000) {
+            if (Math.abs(taskDt.getTime() - now.getTime()) < MATCH_WINDOW_PAST_MS) {
                 console.log(
                     `[task_due] task=${task.id} skip: outside window tz=${tz} taskDt=${taskDt.toISOString()}`,
                 );
@@ -347,7 +448,19 @@ async function processTaskDue(supabase, accessToken, projectId) {
         const title = '📅 Task due';
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
+        const pushData = buildTaskPushData(task.id);
+        if (!pushData) continue;
+
+        const ok = await sendToUser(
+            accessToken,
+            projectId,
+            profile.fcm_token,
+            title,
+            body,
+            task.user_id,
+            supabase,
+            pushData,
+        );
         if (ok) {
             await logNotification(supabase, task.user_id, 'task_due', task.id, title, body);
             sent++;
@@ -400,7 +513,19 @@ async function processOverdueTasks(supabase, accessToken, projectId) {
         const title = pickRandom(OVERDUE_TITLES);
         const body = trimText(task.title);
 
-        const ok = await sendToUser(accessToken, projectId, profile.fcm_token, title, body, task.user_id, supabase);
+        const pushData = buildTaskPushData(task.id);
+        if (!pushData) continue;
+
+        const ok = await sendToUser(
+            accessToken,
+            projectId,
+            profile.fcm_token,
+            title,
+            body,
+            task.user_id,
+            supabase,
+            pushData,
+        );
         if (ok) {
             await logNotification(supabase, task.user_id, 'overdue_task', task.id, title, body);
             sent++;
